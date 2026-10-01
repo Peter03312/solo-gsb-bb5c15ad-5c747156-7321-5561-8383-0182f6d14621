@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 def as_utc(value: datetime) -> datetime:
@@ -56,6 +56,34 @@ class DisableCreate(BaseModel):
 
 class DisableRevoke(BaseModel):
     reason: str | None = Field(None, description="撤销原因（可选）")
+
+
+class ReleaseWindowQuery(BaseModel):
+    """排班规划查询：非空且无重复的仪器标识 + 带时区的起止时间（起点早于终点）。"""
+
+    instruments: list[str] = Field(
+        ..., min_length=1, description="仪器标识列表（非空；服务端拒绝空标识与重复项）"
+    )
+    start: datetime = Field(..., description="查询范围起点（含），必须早于 end")
+    end: datetime = Field(..., description="查询范围终点（不含），开放结论截于此")
+
+    _normalize_start = field_validator("start")(lambda cls, v: as_utc(v))
+    _normalize_end = field_validator("end")(lambda cls, v: as_utc(v))
+
+    @field_validator("instruments")
+    @classmethod
+    def _validate_instruments(cls, value: list[str]) -> list[str]:
+        if any(not item or not item.strip() for item in value):
+            raise ValueError("仪器标识不能为空")
+        if len(set(value)) != len(value):
+            raise ValueError("仪器标识不能重复")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_order(self):
+        if self.end <= self.start:
+            raise ValueError("查询范围必须满足 start < end（左闭右开，非空时段）")
+        return self
 
 
 def serialize_disable(row: dict[str, Any]) -> dict[str, Any]:
