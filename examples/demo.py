@@ -115,6 +115,32 @@ def main() -> None:
     status, body = call("GET", "/disables/affected-reports?instrument=GC-02", None)
     show("撤销后受影响报告为空（原报告与快照不改写）", status, body)
 
+    # ---- 排班规划：一组仪器何时都具备放行条件 ----
+    status, body = call("POST", "/disables", {
+        "event_no": "DIS-GC-2026-003",
+        "instrument": "GC-02",
+        "disabled_from": "2026-03-01T00:00:00Z",
+        "disabled_to": "2026-04-01T00:00:00Z",
+        "reason": "年度检修",
+    })
+    show("再登记一段禁用（演示排班切分）", status, body)
+
+    status, body = call(
+        "GET",
+        "/schedule/release-windows?instrument=GC-02&instrument=HPLC-DEMO"
+        "&from=2026-02-01T00:00:00Z&to=2026-06-01T00:00:00Z",
+        None,
+    )
+    show("排班查询：GC-02 + 无校准仪器（NO_CALIBRATION 不被掩盖）", status, body)
+
+    status, body = call(
+        "GET",
+        "/schedule/release-windows?instrument=GC-02&instrument=GC-02"
+        "&from=2026-02-01T00:00:00Z&to=2026-06-01T00:00:00Z",
+        None,
+    )
+    show("重复仪器标识（应 422 DUPLICATE_INSTRUMENT）", status, body)
+
 
 if __name__ == "__main__":
     main()

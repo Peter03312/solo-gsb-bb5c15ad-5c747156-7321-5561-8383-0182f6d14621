@@ -113,3 +113,12 @@ echo "== 15. 撤销后受影响报告查询为空；事件记录仍可查 =="
 curl -sS "$BASE/disables/affected-reports?instrument=HPLC-01" | pp
 curl -sS "$BASE/disables/DIS-2026-001" | pp
 
+echo "== 16. 排班规划：HPLC-01 + GC-02 在 2026-02-01 ~ 2026-06-01 何时全部可放行 =="
+curl -sS "$BASE/schedule/release-windows?instrument=HPLC-01&instrument=GC-02&from=2026-02-01T00:00:00Z&to=2026-06-01T00:00:00Z" | pp
+
+echo "== 17. 排班查询参数校验：重复仪器 -> 422 DUPLICATE_INSTRUMENT；from>=to -> 422 INVALID_INTERVAL =="
+curl -sS -o /dev/stderr -w 'HTTP %{http_code}\n' \
+  "$BASE/schedule/release-windows?instrument=HPLC-01&instrument=HPLC-01&from=2026-02-01T00:00:00Z&to=2026-06-01T00:00:00Z"
+curl -sS -o /dev/stderr -w 'HTTP %{http_code}\n' \
+  "$BASE/schedule/release-windows?instrument=HPLC-01&from=2026-06-01T00:00:00Z&to=2026-02-01T00:00:00Z"
+

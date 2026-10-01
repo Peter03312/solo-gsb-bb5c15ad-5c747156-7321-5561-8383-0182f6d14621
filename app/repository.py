@@ -403,6 +403,111 @@ def _drift(conn, instrument: str | None) -> list[dict[str, Any]]:
     return drifted
 
 
+# ---- 排班查询：成组仪器放行窗口 ------------------------------------------------
+
+def _instrument_entry_at(cal_rows: list[dict[str, Any]],
+                         disable_rows: list[dict[str, Any]],
+                         at: datetime) -> dict[str, Any]:
+    """单仪器在某时点的放行判定（与发布同一套规则：未撤销禁用优先于校准）。
+
+    排他约束保证同一时点至多命中一条未撤销禁用区间、一条当前校准版本。
+    """
+    for row in disable_rows:
+        if row["disabled_from"] <= at and (row["disabled_to"] is None or at < row["disabled_to"]):
+            return {"releasable": False, "reason_code": REASON_DISABLED,
+                    "disable": disable_brief(row), "basis_calibration": None}
+    for row in cal_rows:
+        if row["valid_from"] <= at and (row["valid_to"] is None or at < row["valid_to"]):
+            brief = _cal_brief(row)
+            if row["passed"]:
+                return {"releasable": True, "reason_code": REASON_PASSED,
+                        "basis_calibration": brief, "disable": None}
+            return {"releasable": False, "reason_code": REASON_NOT_PASSED,
+                    "basis_calibration": brief, "disable": None}
+    reason = REASON_NO_CALIBRATION if not cal_rows else REASON_OUTSIDE_PERIOD
+    return {"releasable": False, "reason_code": reason,
+            "basis_calibration": None, "disable": None}
+
+
+def release_windows(conn, instruments: list[str],
+                    start: datetime, end: datetime) -> list[dict[str, Any]]:
+    """把查询范围 [start, end) 切分为按时间排序的左闭右开时段。
+
+    每段给出全组是否可放行与各仪器原因码及所据禁用事件/校准版本；
+    仅当全组结论与各仪器依据均相同时才合并相邻时段。开放终点（NULL）
+    不产生边界，自然截在查询终点。整次查询运行在调用方的 SERIALIZABLE
+    只读事务内，依据同一已提交快照；结果仅供排班规划，不预占未来放行资格。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM calibration_versions "
+            "WHERE instrument = ANY(%s) AND is_current = TRUE "
+            "ORDER BY instrument, valid_from",
+            (instruments,),
+        )
+        cal_rows = cur.fetchall()
+        cur.execute(
+            "SELECT * FROM instrument_disable_events "
+            "WHERE instrument = ANY(%s) AND revoked = FALSE "
+            "ORDER BY instrument, disabled_from",
+            (instruments,),
+        )
+        disable_rows = cur.fetchall()
+
+    cals: dict[str, list[dict[str, Any]]] = {i: [] for i in instruments}
+    for row in cal_rows:
+        cals[row["instrument"]].append(row)
+    disables: dict[str, list[dict[str, Any]]] = {i: [] for i in instruments}
+    for row in disable_rows:
+        disables[row["instrument"]].append(row)
+
+    # 边界点：查询首尾 + 落在范围内的校准/禁用区间端点（范围外端点不影响切分）
+    boundaries = {start, end}
+    for row in cal_rows:
+        if start < row["valid_from"] < end:
+            boundaries.add(row["valid_from"])
+        if row["valid_to"] is not None and start < row["valid_to"] < end:
+            boundaries.add(row["valid_to"])
+    for row in disable_rows:
+        if start < row["disabled_from"] < end:
+            boundaries.add(row["disabled_from"])
+        if row["disabled_to"] is not None and start < row["disabled_to"] < end:
+            boundaries.add(row["disabled_to"])
+    points = sorted(boundaries)
+
+    segments: list[dict[str, Any]] = []
+    for seg_start, seg_end in zip(points, points[1:]):
+        # 段内无边界，任取一点即可代表全段；取左端点（左闭右开语义）
+        entries: dict[str, Any] = {}
+        merge_key = []
+        for instrument in instruments:
+            entry = _instrument_entry_at(cals[instrument], disables[instrument],
+                                         seg_start)
+            entries[instrument] = entry
+            basis_cal = entry["basis_calibration"]
+            basis_dis = entry["disable"]
+            merge_key.append((
+                instrument,
+                entry["reason_code"],
+                basis_cal["id"] if basis_cal else None,
+                basis_dis["event_no"] if basis_dis else None,
+            ))
+        group_ok = all(e["releasable"] for e in entries.values())
+        key = (group_ok, tuple(merge_key))
+        if segments and segments[-1]["_merge_key"] == key:
+            segments[-1]["to"] = seg_end  # 结论与依据均相同：合并相邻时段
+            continue
+        segments.append({"from": seg_start, "to": seg_end,
+                         "releasable": group_ok, "instruments": entries,
+                         "_merge_key": key})
+
+    return [
+        {"from": seg["from"].isoformat(), "to": seg["to"].isoformat(),
+         "releasable": seg["releasable"], "instruments": seg["instruments"]}
+        for seg in segments
+    ]
+
+
 # ---- 禁用区间：登记 / 撤销 / 查询 ----------------------------------------------
 
 def register_disable(conn, payload) -> dict[str, Any]:

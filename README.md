@@ -25,6 +25,9 @@
 - 禁用变更、校准更正与报告发布事务均运行在 **SERIALIZABLE** 隔离级别并对冲突自动重试，
   配合唯一部分索引、GiST 排他约束与行锁，杜绝“双最新版”、“禁用区间重叠”和
   “在已生效禁用区间内误放行”。
+- 排班规划查询：给定一组仪器与时间范围，按与发布相同的规则（未撤销禁用优先、
+  当前校准版本覆盖且通过）切分出全组何时都具备放行条件；整次查询运行在同一
+  SERIALIZABLE 只读事务内，依据同一已提交快照，结果仅供规划、不预占未来放行资格。
 
 ## 一键启动
 
@@ -103,6 +106,12 @@ uvicorn app.main:app --reload
 | GET | `/disables?instrument=&include_revoked=` | 禁用事件列表（默认含已撤销，供追溯） |
 | GET | `/disables/{event_no}` | 按事件号查看单条禁用事件（含已撤销） |
 | GET | `/disables/affected-reports?instrument=` | 当前受禁用影响的已发布报告及禁用依据 |
+
+### 排班规划（本轮新增）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/schedule/release-windows?instrument=&from=&to=` | 一组仪器在指定范围内何时全部具备放行条件（只读） |
 
 ## 调用示例
 
@@ -329,6 +338,74 @@ curl -sS 'http://localhost:8000/disables/affected-reports?instrument=HPLC-01'
 }
 ```
 
+### 9. 排班规划：查询一组仪器何时都具备放行条件
+
+```bash
+curl -sS 'http://localhost:8000/schedule/release-windows?instrument=HPLC-01&instrument=GC-02&from=2026-02-01T00:00:00Z&to=2026-06-01T00:00:00Z'
+```
+
+- `instrument` 重复传参给出仪器组（非空、不可重复）；`from`/`to` 为带时区的起止时间
+  （`from < to`，左闭右开），无时区按 UTC 处理。
+- 按与报告发布相同的规则切分：**未撤销禁用区间优先**，未命中禁用时要求
+  **当前校准版本覆盖且通过**；校准/禁用边界与查询首尾均精确切分，
+  开放终点（`null`）截在查询终点。
+- 返回按时间排序、首尾相接的左闭右开时段，恰好覆盖整个查询范围；每段给出
+  全组 `releasable` 与各仪器 `reason_code` 及所据 `disable`（禁用事件）或
+  `basis_calibration`（校准版本）。仅当全组结论与各仪器依据均相同时才合并相邻时段。
+- 无当前校准的仪器显示 `NO_CALIBRATION`，全组结论不会被其他仪器的可放行掩盖。
+- 整次查询运行在同一 SERIALIZABLE 只读事务内，依据同一已提交快照；
+  与更正、禁用登记或撤销并发时不混用前后状态。
+- **结果仅供排班规划，不预占未来放行资格**；正式报告仍以提交时刻的判定为准。
+
+响应示例（HPLC-01 在 [3/1,5/1) 命中禁用，GC-02 全程可放行）：
+
+```json
+{
+  "instruments": ["HPLC-01", "GC-02"],
+  "from": "2026-02-01T00:00:00+00:00",
+  "to": "2026-06-01T00:00:00+00:00",
+  "segments": [
+    {
+      "from": "2026-02-01T00:00:00+00:00",
+      "to": "2026-03-01T00:00:00+00:00",
+      "releasable": true,
+      "instruments": {
+        "HPLC-01": {"releasable": true, "reason_code": "PASSED_CALIBRATION_COVERAGE",
+                    "basis_calibration": {"id": 1, "chain_id": 1, "version": 1, "...": "..."},
+                    "disable": null},
+        "GC-02":   {"releasable": true, "reason_code": "PASSED_CALIBRATION_COVERAGE",
+                    "basis_calibration": {"id": 2, "chain_id": 2, "version": 1, "...": "..."},
+                    "disable": null}
+      }
+    },
+    {
+      "from": "2026-03-01T00:00:00+00:00",
+      "to": "2026-05-01T00:00:00+00:00",
+      "releasable": false,
+      "instruments": {
+        "HPLC-01": {"releasable": false, "reason_code": "INSTRUMENT_DISABLED",
+                    "basis_calibration": null,
+                    "disable": {"event_no": "DIS-2026-001", "instrument": "HPLC-01",
+                                "disabled_from": "2026-03-01T00:00:00+00:00",
+                                "disabled_to": "2026-05-01T00:00:00+00:00",
+                                "reason": "进样阀故障待修"}},
+        "GC-02":   {"releasable": true, "reason_code": "PASSED_CALIBRATION_COVERAGE",
+                    "basis_calibration": {"id": 2, "...": "..."}, "disable": null}
+      }
+    },
+    {"from": "2026-05-01T00:00:00+00:00", "to": "2026-06-01T00:00:00+00:00",
+     "releasable": true, "instruments": {"...": "..."}}
+  ],
+  "count": 3
+}
+```
+
+参数校验（`detail.code`，与既有错误约定一致）：
+
+- 仪器列表为空或含空白标识：`422 EMPTY_INSTRUMENT_LIST`；
+- 仪器标识重复：`422 DUPLICATE_INSTRUMENT`（`detail.duplicates` 列出重复项）；
+- `from >= to`：`422 INVALID_INTERVAL`。
+
 ### 脚本化完整演示
 
 ```bash
@@ -359,3 +436,7 @@ BASE_URL=http://localhost:8000 python3 examples/demo.py   # 含并发更正与�
    未知事件 `404`、重复撤销 `409 DISABLE_ALREADY_REVOKED`。
 6. **追溯一致**：受影响报告查询为 SERIALIZABLE 只读事务，按当前未撤销禁用区间实时计算，
    不物化、不改写报告与快照；登记/撤销的结果对之后的查询立即可见。
+7. **排班查询快照一致**：`/schedule/release-windows` 整次切分运行在同一 SERIALIZABLE
+   只读事务内，所有仪器、所有时段依据同一已提交快照；并发的更正、禁用登记或撤销
+   要么整体可见、要么整体不可见，不会在同一次查询结果中混用前后状态。
+   查询本身只读，不落库、不预占未来放行资格。
